@@ -672,18 +672,8 @@ static u8 build_attr(struct vc_data *vc, u8 _color,
 		       (_underline << 2) |
 		       (_reverse   << 3) |
 		       (_blink     << 7);
-	if (_italic)
-		a = (a & 0xF0) | vc->vc_itcolor;
-	else if (_underline)
-		a = (a & 0xf0) | vc->vc_ulcolor;
-	else if (_intensity == VCI_HALF_BRIGHT)
-		a = (a & 0xf0) | vc->vc_halfcolor;
 	if (_reverse)
-		a = (a & 0x88) | (((a >> 4) | (a << 4)) & 0x77);
-	if (_blink)
-		a ^= 0x80;
-	if (_intensity == VCI_BOLD)
-		a ^= 0x08;
+		a = (a >> 4) | (a << 4);
 	if (vc->vc_hi_font_mask == 0x100)
 		a <<= 1;
 	return a;
@@ -1596,55 +1586,6 @@ static void default_attr(struct vc_data *vc)
 	vc->state.color = vc->vc_def_color;
 }
 
-struct rgb { u8 r; u8 g; u8 b; };
-
-static void rgb_from_256(int i, struct rgb *c)
-{
-	if (i < 8) {            /* Standard colours. */
-		c->r = i&1 ? 0xaa : 0x00;
-		c->g = i&2 ? 0xaa : 0x00;
-		c->b = i&4 ? 0xaa : 0x00;
-	} else if (i < 16) {
-		c->r = i&1 ? 0xff : 0x55;
-		c->g = i&2 ? 0xff : 0x55;
-		c->b = i&4 ? 0xff : 0x55;
-	} else if (i < 232) {   /* 6x6x6 colour cube. */
-		c->r = (i - 16) / 36 * 85 / 2;
-		c->g = (i - 16) / 6 % 6 * 85 / 2;
-		c->b = (i - 16) % 6 * 85 / 2;
-	} else                  /* Grayscale ramp. */
-		c->r = c->g = c->b = i * 10 - 2312;
-}
-
-static void rgb_foreground(struct vc_data *vc, const struct rgb *c)
-{
-	u8 hue = 0, max = max3(c->r, c->g, c->b);
-
-	if (c->r > max / 2)
-		hue |= 4;
-	if (c->g > max / 2)
-		hue |= 2;
-	if (c->b > max / 2)
-		hue |= 1;
-
-	if (hue == 7 && max <= 0x55) {
-		hue = 0;
-		vc->state.intensity = VCI_BOLD;
-	} else if (max > 0xaa)
-		vc->state.intensity = VCI_BOLD;
-	else
-		vc->state.intensity = VCI_NORMAL;
-
-	vc->state.color = (vc->state.color & 0xf0) | hue;
-}
-
-static void rgb_background(struct vc_data *vc, const struct rgb *c)
-{
-	/* For backgrounds, err on the dark side. */
-	vc->state.color = (vc->state.color & 0x0f)
-		| (c->r&0x80) >> 1 | (c->g&0x80) >> 2 | (c->b&0x80) >> 3;
-}
-
 /*
  * ITU T.416 Higher colour modes. They break the usual properties of SGR codes
  * and thus need to be detected and ignored by hand. That standard also
@@ -1654,29 +1595,46 @@ static void rgb_background(struct vc_data *vc, const struct rgb *c)
  * Subcommands 3 (CMY) and 4 (CMYK) are so insane there's no point in
  * supporting them.
  */
-static int vc_t416_color(struct vc_data *vc, int i,
-		void(*set_color)(struct vc_data *vc, const struct rgb *c))
+static int vc_t416_color_fg(struct vc_data *vc, int i)
 {
-	struct rgb c;
 
 	i++;
 	if (i > vc->vc_npar)
 		return i;
 
 	if (vc->vc_par[i] == 5 && i + 1 <= vc->vc_npar) {
-		/* 256 colours */
+		/* 256 colours, use if 0-15 */
 		i++;
-		rgb_from_256(vc->vc_par[i], &c);
+		if (vc->vc_par[i] < 16) {
+			vc->state.color = color_table[vc->vc_par[i]]
+				| (vc->state.color & 0xf0);
+		}
 	} else if (vc->vc_par[i] == 2 && i + 3 <= vc->vc_npar) {
-		/* 24 bit */
-		c.r = vc->vc_par[i + 1];
-		c.g = vc->vc_par[i + 2];
-		c.b = vc->vc_par[i + 3];
+		/* 24 bit color definitions, just ignore them */
 		i += 3;
-	} else
+	}
+
+	return i;
+}
+
+static int vc_t416_color_bg(struct vc_data *vc, int i)
+{
+
+	i++;
+	if (i > vc->vc_npar)
 		return i;
 
-	set_color(vc, &c);
+	if (vc->vc_par[i] == 5 && i + 1 <= vc->vc_npar) {
+		/* 256 colours, use if 0-15 */
+		i++;
+		if (vc->vc_par[i] < 16) {
+			vc->state.color = (color_table[vc->vc_par[i]] << 4)
+				| (vc->state.color & 0x0f);
+		}
+	} else if (vc->vc_par[i] == 2 && i + 3 <= vc->vc_npar) {
+		/* 24 bit color definitions, just ignore them */
+		i += 3;
+	}
 
 	return i;
 }
@@ -1753,32 +1711,65 @@ static void csi_m(struct vc_data *vc)
 		case 27:
 			vc->state.reverse = false;
 			break;
-		case 38:
-			i = vc_t416_color(vc, i, rgb_foreground);
+		case 30:
+		case 31:
+		case 32:
+		case 33:
+		case 34:
+		case 35:
+		case 36:
+		case 37:
+			vc->state.color = color_table[vc->vc_par[i] - 30]
+				| (vc->state.color & 0xf0);
 			break;
-		case 48:
-			i = vc_t416_color(vc, i, rgb_background);
+		case 38:
+			i = vc_t416_color_fg(vc, i);
 			break;
 		case 39:
 			vc->state.color = (vc->vc_def_color & 0x0f) |
 				(vc->state.color & 0xf0);
 			break;
+		case 40:
+		case 41:
+		case 42:
+		case 43:
+		case 44:
+		case 45:
+		case 46:
+		case 47:
+			vc->state.color = (color_table[vc->vc_par[i] - 40] << 4)
+				| (vc->state.color & 0x0f);
+			break;
+		case 48:
+			i = vc_t416_color_bg(vc, i);
+			break;
 		case 49:
 			vc->state.color = (vc->vc_def_color & 0xf0) |
 				(vc->state.color & 0x0f);
 			break;
+		case 90:
+		case 91:
+		case 92:
+		case 93:
+		case 94:
+		case 95:
+		case 96:
+		case 97:
+			vc->state.color = color_table[vc->vc_par[i] - 82]
+				| (vc->state.color & 0xf0);
+			break;
+		case 100:
+		case 101:
+		case 102:
+		case 103:
+		case 104:
+		case 105:
+		case 106:
+		case 107:
+			vc->state.color = (color_table[vc->vc_par[i] - 92] << 4)
+				| (vc->state.color & 0x0f);
+			break;
 		default:
-			if (vc->vc_par[i] >= 90 && vc->vc_par[i] <= 107) {
-				if (vc->vc_par[i] < 100)
-					vc->state.intensity = VCI_BOLD;
-				vc->vc_par[i] -= 60;
-			}
-			if (vc->vc_par[i] >= 30 && vc->vc_par[i] <= 37)
-				vc->state.color = color_table[vc->vc_par[i] - 30]
-					| (vc->state.color & 0xf0);
-			else if (vc->vc_par[i] >= 40 && vc->vc_par[i] <= 47)
-				vc->state.color = (color_table[vc->vc_par[i] - 40] << 4)
-					| (vc->state.color & 0x0f);
 			break;
 		}
 	update_attr(vc);
